@@ -49,4 +49,4 @@
   - Enable a firewall and open only required ports.
   - Use strong authentication (keys or strong passwords) for any remote access.
   - Review and update this policy to cover new remote risks.
-  - so until then stop being a pretentious fuck and just wait and coordinate.
+  
