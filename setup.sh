@@ -13,7 +13,7 @@ echo "╚═══════════════════════�
 echo ""
 echo "[1/4] Installing system dependencies..."
 apt-get update
-apt-get install -y python3-pip python3-venv i2c-tools libgpiod2 python3-libgpiod
+apt-get install -y python3-pip python3-venv i2c-tools libgpiod3 python3-libgpiod
 
 # 2. Enable I2C (if not already enabled)
 echo ""
@@ -33,7 +33,7 @@ if [ ! -d "$VENV_DIR" ]; then
     sudo -u "$(logname)" python3 -m venv "$VENV_DIR"
 fi
 sudo -u "$(logname)" "$VENV_DIR/bin/pip" install --upgrade pip
-sudo -u "$(logname)" "$VENV_DIR/bin/pip" install -r /home/$(logname)/smart_helmet/requirements.txt
+sudo -u "$(logname)" "$VENV_DIR/bin/pip" install -r /home/$(logname)/Smart-Helmet-Fall-Helmet-Removal-Detection-System/requirements.txt
 
 # 4. Verify I2C devices
 echo ""

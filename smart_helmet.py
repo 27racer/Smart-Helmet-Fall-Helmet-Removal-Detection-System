@@ -14,7 +14,7 @@ Components & GPIO Pin Map:
   SSD1306 OLED (I2C)  : SDA = GPIO2, SCL = GPIO3  (addr 0x3C)
   Touch Sensor         : GPIO18
   IR Sensor            : GPIO20
-  KY-012 Buzzer        : GPIO17
+  KY-006 Buzzer        : GPIO17
 """
 
 import time
@@ -25,7 +25,8 @@ import signal
 import sys
 
 # ─── GPIO (works on Raspberry Pi 5 via lgpio / gpiozero) ───
-from gpiozero import DigitalOutputDevice, DigitalInputDevice, Buzzer as GpioZeroBuzzer
+from gpiozero import DigitalOutputDevice, DigitalInputDevice, TonalBuzzer
+from gpiozero.tones import Tone
 import board
 import busio
 
@@ -46,7 +47,7 @@ PIN_ECHO        = 24      # HC-SR04 echo
 PIN_DHT22       = 21      # DHT22 data
 PIN_TOUCH       = 18      # Touch sensor (helmet-on detection)
 PIN_IR          = 20      # IR proximity sensor (digital out)
-PIN_BUZZER      = 17      # KY-012 active buzzer
+PIN_BUZZER      = 17      # KY-006 passive buzzer
 
 # --- I2C Addresses ---
 ADDR_MPU6050    = 0x68
@@ -263,18 +264,17 @@ def compute_heat_index(temp_c, humidity):
 # ═══════════════════════════════════════════════════════════════
 #  ALERT / BUZZER MANAGER
 # ═══════════════════════════════════════════════════════════════
-
 class AlertManager:
-    """Manages buzzer patterns to avoid overlapping beeps."""
+    """Manages PWM buzzer patterns to avoid overlapping tones."""
 
     PATTERN_NONE        = 0
     PATTERN_WARN        = 1   # short beep
     PATTERN_DANGER      = 2   # rapid double beep
-    PATTERN_FALL        = 3   # continuous alarm
-    PATTERN_HELMET_OFF  = 4   # repeating long beep
+    PATTERN_FALL        = 3   # fast repeated alarm
+    PATTERN_HELMET_OFF  = 4   # repeating long tone
 
     def __init__(self, buzzer_pin):
-        self.buzzer = GpioZeroBuzzer(buzzer_pin)
+        self.buzzer = TonalBuzzer(buzzer_pin, octaves=3)
         self._current = self.PATTERN_NONE
         self._running = True
         self._lock = threading.Lock()
@@ -285,31 +285,48 @@ class AlertManager:
         with self._lock:
             self._current = pattern
 
+    def _play_tone(self, note="A5", duration=0.2):
+        try:
+            self.buzzer.play(Tone(note))
+            time.sleep(duration)
+        finally:
+            self.buzzer.stop()
+
+    def _silence(self, duration):
+        self.buzzer.stop()
+        time.sleep(duration)
+
     def _loop(self):
         while self._running:
             with self._lock:
                 p = self._current
+
             if p == self.PATTERN_NONE:
-                self.buzzer.off()
-                time.sleep(0.1)
+                self._silence(0.1)
+
             elif p == self.PATTERN_WARN:
-                self.buzzer.on(); time.sleep(BUZZER_SHORT_BEEP)
-                self.buzzer.off(); time.sleep(0.9)
+                self._play_tone("A5", BUZZER_SHORT_BEEP)
+                self._silence(0.9)
+
             elif p == self.PATTERN_DANGER:
-                self.buzzer.on(); time.sleep(BUZZER_SHORT_BEEP)
-                self.buzzer.off(); time.sleep(0.1)
-                self.buzzer.on(); time.sleep(BUZZER_SHORT_BEEP)
-                self.buzzer.off(); time.sleep(0.6)
+                self._play_tone("B6", BUZZER_SHORT_BEEP)
+                self._silence(0.08)
+                self._play_tone("E6", BUZZER_SHORT_BEEP)
+                self._silence(0.55)
+
             elif p == self.PATTERN_FALL:
-                self.buzzer.on(); time.sleep(0.3)
-                self.buzzer.off(); time.sleep(0.1)
+                self._play_tone("B6", 0.5)
+                self._silence(0.04)
+                self._play_tone("E6", 0.5)
+                self._silence(0.04)
+
             elif p == self.PATTERN_HELMET_OFF:
-                self.buzzer.on(); time.sleep(BUZZER_LONG_BEEP)
-                self.buzzer.off(); time.sleep(0.5)
+                self._play_tone("B6", BUZZER_LONG_BEEP)
+                self._silence(0.5)
 
     def stop(self):
         self._running = False
-        self.buzzer.off()
+        self.buzzer.stop()
         self.buzzer.close()
 
 
