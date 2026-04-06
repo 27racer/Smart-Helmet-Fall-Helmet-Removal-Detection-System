@@ -535,14 +535,23 @@ class SmartHelmet:
 
     def _read_dht(self):
         try:
-            t = self.dht.temperature
-            h = self.dht.humidity
-            if t is not None and h is not None:
-                self.last_temp = round(t, 1)
-                self.last_hum = round(h, 1)
-                self.last_heat_index = compute_heat_index(t, h)
-        except RuntimeError:
-            pass  # DHT22 occasionally fails — just skip
+            import signal
+            def _dht_timeout(signum, frame):
+                raise TimeoutError("DHT22 read timeout")
+            old = signal.signal(signal.SIGALRM, _dht_timeout)
+            signal.alarm(1)  # 1 second timeout
+            try:
+                t = self.dht.temperature
+                h = self.dht.humidity
+                signal.alarm(0)
+                if t is not None and h is not None:
+                    self.last_temp = round(t, 1)
+                    self.last_hum = round(h, 1)
+                    self.last_heat_index = compute_heat_index(t, h)
+            except (TimeoutError, Exception):
+                signal.alarm(0)
+        except Exception:
+            pass  # DHT22 unavailable — skip
 
     def _read_ultrasonic(self):
         d = self.ultrasonic.read_distance_cm()
@@ -663,11 +672,12 @@ class SmartHelmet:
     # ---- console log (for debugging over SSH) ----
 
     def _print_status(self):
+        import sys
         ax, ay, az = self.imu.read_accel()
         gx, gy, gz = self.imu.read_gyro()
         touch = "Y" if self.helmet_det.touch.is_active else "N"
         ir = "Y" if not self.helmet_det.ir.is_active else "N"
-        print(
+        status_line = (
             f"[{self.alert_level:^14s}] "
             f"A({ax:+.2f},{ay:+.2f},{az:+.2f})g  "
             f"G({gx:+.1f},{gy:+.1f},{gz:+.1f})d/s  "
@@ -677,6 +687,48 @@ class SmartHelmet:
             f"Touch={touch}  IR={ir}  "
             f"Helmet={'ON' if not self.helmet_det.helmet_removed else 'OFF'}"
         )
+        print(status_line, flush=True)
+        sys.stdout.flush()
+
+    def _write_api_state(self):
+        """Write latest sensor snapshot to shared JSON file for helmet_api.py."""
+        import json
+        state_file = "/tmp/helmet_api_state.json"
+        total_g    = self.imu.total_g()
+        total_gyro = self.imu.total_gyro()
+        ax, ay, az = self.imu.read_accel()
+        gx, gy, gz = self.imu.read_gyro()
+        touch_active = self.helmet_det.touch.is_active
+        ir_detecting = not self.helmet_det.ir.is_active
+        data = {
+            "accel":         {"x": round(ax, 3), "y": round(ay, 3), "z": round(az, 3)},
+            "gyro":          {"x": round(gx, 2), "y": round(gy, 2), "z": round(gz, 2)},
+            "totalG":        round(total_g, 3),
+            "totalGyro":     round(total_gyro, 2),
+            "fallDetected":  self.fall_det.fall_detected,
+            "temperature":   self.last_temp,
+            "humidity":      self.last_hum,
+            "heatIndex":     self.last_heat_index,
+            "usDist":        self.last_us_dist,
+            "tofDist":       self.last_tof_dist,
+            "lux":           round(self.last_lux, 1) if self.last_lux else None,
+            "touchActive":   touch_active,
+            "irDetecting":   ir_detecting,
+            "helmetOn":      not self.helmet_det.helmet_removed,
+            "alertLevel":    self.alert_level,
+            "timestamp":     self._now_iso(),
+        }
+        try:
+            with open(state_file, "w") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            pass
+
+    def _now_iso(self):
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat()
 
     # ---- main loop ----
 
@@ -707,6 +759,9 @@ class SmartHelmet:
 
                 # 4. Console output (debug)
                 self._print_status()
+
+                # 5. Write shared API state file (for helmet_api.py)
+                self._write_api_state()
 
                 time.sleep(MAIN_LOOP_INTERVAL)
 
