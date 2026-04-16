@@ -23,6 +23,7 @@ import threading
 import struct
 import signal
 import sys
+import os
 
 # ─── GPIO (works on Raspberry Pi 5 via lgpio / gpiozero) ───
 from gpiozero import DigitalOutputDevice, DigitalInputDevice, TonalBuzzer
@@ -45,7 +46,7 @@ from PIL import Image, ImageDraw, ImageFont
 PIN_TRIG        = 23      # HC-SR04 trigger
 PIN_ECHO        = 24      # HC-SR04 echo
 PIN_DHT22       = 21      # DHT22 data
-PIN_TOUCH       = 18      # Touch sensor (helmet-on detection)
+PIN_TOUCH       = 18      # Touch sensor (helmet-on detection, active-low)
 PIN_IR          = 20      # IR proximity sensor (digital out)
 PIN_BUZZER      = 17      # KY-006 passive buzzer
 
@@ -62,7 +63,7 @@ FALL_CONFIRM_MS         = 150     # free-fall must last at least this long
 GYRO_TUMBLE_THRESHOLD   = 250.0   # deg/s — rapid rotation = tumbling
 
 # --- Helmet Removal Detection (Touch + IR) ---
-HELMET_REMOVAL_SECONDS  = 3       # sensors must agree "no head" this long
+HELMET_REMOVAL_SECONDS  = 3       # touch must be absent this long before helmet is marked off
 
 # --- Proximity / Collision Warning ---
 ULTRASONIC_WARN_CM      = 100     # warn if obstacle < 100 cm
@@ -91,6 +92,10 @@ BUZZER_LONG_BEEP        = 0.5
 
 # -------- I2C bus (shared) --------
 i2c = busio.I2C(board.SCL, board.SDA)
+
+
+class SensorUnavailableError(Exception):
+    """Raised when a sensor should be disabled after repeated hardware failures."""
 
 
 # ===================== MPU6050 (raw I2C) =====================
@@ -426,37 +431,29 @@ class FallDetector:
 
 class HelmetRemovalDetector:
     """
-    Uses TWO sensors for reliable helmet-on/off detection:
+    Helmet-on/off detection using the touch sensor only.
 
-      Touch sensor (GPIO18) — mounted inside the helmet, touching
-        the wearer's head. HIGH = head contact, LOW = no contact.
+      Touch sensor (GPIO18) — mounted inside the helmet.
+      This wiring is treated as active-low:
+        LOW = head contact, HIGH = no contact.
 
-      IR sensor (GPIO20) — mounted inside the helmet, pointing at
-        the head. LOW = object detected (head present), HIGH = no object.
-
-    Both sensors must agree that the head is absent for
-    HELMET_REMOVAL_SECONDS before triggering the alert.
-    This dual-sensor approach prevents false positives.
+    If touch contact is absent continuously for
+    HELMET_REMOVAL_SECONDS, the helmet is considered removed.
     """
 
     def __init__(self, touch_pin, ir_pin):
-        # Touch sensor: HIGH when touching head
-        self.touch = DigitalInputDevice(touch_pin, pull_up=False)
-        # IR sensor: LOW when object (head) is detected (active-low)
+        # Touch sensor wired active-low: LOW when touching head
+        self.touch = DigitalInputDevice(touch_pin, pull_up=True)
+        # IR sensor remains available for telemetry only
         self.ir = DigitalInputDevice(ir_pin, pull_up=True)
 
         self._no_head_since = None
         self.helmet_removed = False
 
     def _head_present(self):
-        """
-        Returns True if the helmet appears to be on the head.
-        Either sensor detecting the head counts as "present"
-        to avoid false removals.
-        """
-        touch_active = self.touch.is_active       # HIGH = head touching
-        ir_detecting = not self.ir.is_active       # LOW  = object nearby
-        return touch_active or ir_detecting
+        """Returns True if the touch sensor detects head contact."""
+        touch_active = not self.touch.is_active   # LOW = head touching
+        return touch_active
 
     def update(self):
         now = time.monotonic()
@@ -494,30 +491,55 @@ class SmartHelmet:
         self.imu = MPU6050(i2c)
 
         print("  -> VL53L0X ToF")
-        self.tof = adafruit_vl53l0x.VL53L0X(i2c)
+        print("  !! VL53L0X disabled by configuration")
+        self.tof = None
 
         print("  -> BH1750 Light")
-        self.light = BH1750(i2c)
+        try:
+            self.light = BH1750(i2c)
+        except Exception as e:
+            print(f"  !! BH1750 unavailable: {e}")
+            self.light = None
 
         print("  -> SSD1306 OLED")
-        self.oled = OLEDDisplay(i2c)
+        try:
+            self.oled = OLEDDisplay(i2c)
+        except Exception as e:
+            print(f"  !! OLED unavailable: {e}")
+            self.oled = None
 
         # ---- GPIO Sensors ----
         print("  -> HC-SR04 Ultrasonic")
-        self.ultrasonic = HCSR04(PIN_TRIG, PIN_ECHO)
+        try:
+            self.ultrasonic = HCSR04(PIN_TRIG, PIN_ECHO)
+        except Exception as e:
+            print(f"  !! Ultrasonic unavailable: {e}")
+            self.ultrasonic = None
 
         print("  -> DHT22 Temp/Humidity")
-        self.dht = adafruit_dht.DHT22(getattr(board, f"D{PIN_DHT22}"))
+        try:
+            self.dht = adafruit_dht.DHT22(getattr(board, f"D{PIN_DHT22}"))
+        except Exception as e:
+            print(f"  !! DHT22 unavailable: {e}")
+            self.dht = None
 
         print("  -> Touch Sensor + IR Sensor (helmet detection)")
-        self.helmet_det = HelmetRemovalDetector(PIN_TOUCH, PIN_IR)
+        try:
+            self.helmet_det = HelmetRemovalDetector(PIN_TOUCH, PIN_IR)
+        except Exception as e:
+            print(f"  !! Helmet sensors unavailable: {e}")
+            self.helmet_det = None
 
         # ---- Output ----
         print("  -> Buzzer")
-        self.alerts = AlertManager(PIN_BUZZER)
+        try:
+            self.alerts = AlertManager(PIN_BUZZER)
+        except Exception as e:
+            print(f"  !! Buzzer unavailable: {e}")
+            self.alerts = None
 
         # ---- Detection Engines ----
-        self.fall_det = FallDetector(self.imu)
+        self.fall_det = FallDetector(self.imu) if self.imu is not None else None
 
         # ---- State ----
         self.running = True
@@ -528,12 +550,55 @@ class SmartHelmet:
         self.last_us_dist = None
         self.last_tof_dist = None
         self.alert_level = "OK"  # OK | WARN | DANGER | FALL | HELMET_OFF
+        self._error_counts = {
+            "imu": 0,
+            "tof": 0,
+            "light": 0,
+            "ultrasonic": 0,
+            "dht": 0,
+            "helmet": 0,
+            "oled": 0,
+        }
 
         print("[INIT] All systems ready.\n")
+
+    def _record_sensor_error(self, sensor_name, error):
+        count = self._error_counts.get(sensor_name, 0) + 1
+        self._error_counts[sensor_name] = count
+        print(f"[WARN] {sensor_name} error #{count}: {error}", flush=True)
+        if count >= 5:
+            raise SensorUnavailableError(sensor_name)
+
+    def _reset_sensor_error(self, sensor_name):
+        self._error_counts[sensor_name] = 0
+
+    def _disable_sensor(self, sensor_name, error=None):
+        if error is not None:
+            print(f"[WARN] disabling {sensor_name}: {error}", flush=True)
+        if sensor_name == "tof":
+            self.tof = None
+            self.last_tof_dist = None
+        elif sensor_name == "light":
+            self.light = None
+            self.last_lux = None
+        elif sensor_name == "ultrasonic":
+            self.ultrasonic = None
+            self.last_us_dist = None
+        elif sensor_name == "dht":
+            self.dht = None
+            self.last_temp = None
+            self.last_hum = None
+            self.last_heat_index = None
+        elif sensor_name == "helmet":
+            self.helmet_det = None
+        elif sensor_name == "oled":
+            self.oled = None
 
     # ---- sensor read helpers (with error handling) ----
 
     def _read_dht(self):
+        if self.dht is None:
+            return
         try:
             import signal
             def _dht_timeout(signum, frame):
@@ -544,51 +609,93 @@ class SmartHelmet:
                 t = self.dht.temperature
                 h = self.dht.humidity
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+                self._reset_sensor_error("dht")
                 if t is not None and h is not None:
                     self.last_temp = round(t, 1)
                     self.last_hum = round(h, 1)
                     self.last_heat_index = compute_heat_index(t, h)
-            except (TimeoutError, Exception):
+            except (TimeoutError, Exception) as e:
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, old)
+                self._record_sensor_error("dht", e)
+        except SensorUnavailableError as e:
+            self._disable_sensor("dht", e)
         except Exception:
             pass  # DHT22 unavailable — skip
 
     def _read_ultrasonic(self):
-        d = self.ultrasonic.read_distance_cm()
-        if d > 0:
-            self.last_us_dist = d
+        if self.ultrasonic is None:
+            return
+        try:
+            d = self.ultrasonic.read_distance_cm()
+            self._reset_sensor_error("ultrasonic")
+            if d > 0:
+                self.last_us_dist = d
+        except Exception as e:
+            try:
+                self._record_sensor_error("ultrasonic", e)
+            except SensorUnavailableError as disable_exc:
+                self._disable_sensor("ultrasonic", disable_exc)
 
     def _read_tof(self):
+        if self.tof is None:
+            return
         try:
             self.last_tof_dist = self.tof.range  # mm
-        except RuntimeError:
-            pass
+            self._reset_sensor_error("tof")
+        except RuntimeError as e:
+            try:
+                self._record_sensor_error("tof", e)
+            except SensorUnavailableError as disable_exc:
+                self._disable_sensor("tof", disable_exc)
 
     def _read_light(self):
+        if self.light is None:
+            return
         try:
             self.last_lux = round(self.light.read_lux(), 1)
-        except Exception:
-            pass
+            self._reset_sensor_error("light")
+        except Exception as e:
+            try:
+                self._record_sensor_error("light", e)
+            except SensorUnavailableError as disable_exc:
+                self._disable_sensor("light", disable_exc)
 
     # ---- decision logic ----
 
     def _evaluate_alerts(self):
         """Determine the highest-priority alert."""
-        # Priority: FALL > HELMET_OFF > DANGER > WARN > OK
+        # Helmet off means the helmet is not being worn, so silence alerts.
         priority = AlertManager.PATTERN_NONE
         self.alert_level = "OK"
 
-        # 1. Fall detection (highest priority)
-        if self.fall_det.update():
-            self.alert_level = "!! FALL !!"
-            priority = AlertManager.PATTERN_FALL
+        try:
+            helmet_removed = self.helmet_det is not None and self.helmet_det.update()
+            if self.helmet_det is not None:
+                self._reset_sensor_error("helmet")
+        except SensorUnavailableError as e:
+            self._disable_sensor("helmet", e)
+            helmet_removed = False
+        except Exception as e:
+            self._record_sensor_error("helmet", e)
+            helmet_removed = False
 
-        # 2. Helmet removal
-        if self.helmet_det.update() and priority < AlertManager.PATTERN_HELMET_OFF:
+        if helmet_removed:
             self.alert_level = "HELMET OFF"
-            priority = AlertManager.PATTERN_HELMET_OFF
+            if self.alerts is not None:
+                self.alerts.set_pattern(AlertManager.PATTERN_NONE)
+            return
 
-        # 3. Proximity danger (ultrasonic)
+        # Priority while worn: FALL > DANGER > WARN > OK
+        try:
+            if self.fall_det is not None and self.fall_det.update():
+                self.alert_level = "!! FALL !!"
+                priority = AlertManager.PATTERN_FALL
+        except Exception as e:
+            self._record_sensor_error("imu", e)
+
+        # Proximity danger (ultrasonic)
         if self.last_us_dist is not None:
             if self.last_us_dist < ULTRASONIC_DANGER_CM and priority < AlertManager.PATTERN_DANGER:
                 self.alert_level = "PROX DANGER"
@@ -597,7 +704,7 @@ class SmartHelmet:
                 self.alert_level = "PROX WARN"
                 priority = AlertManager.PATTERN_WARN
 
-        # 4. Proximity danger (ToF)
+        # Proximity danger (ToF)
         if self.last_tof_dist is not None:
             if self.last_tof_dist < TOF_DANGER_MM and priority < AlertManager.PATTERN_DANGER:
                 self.alert_level = "TOF DANGER"
@@ -606,7 +713,7 @@ class SmartHelmet:
                 self.alert_level = "TOF WARN"
                 priority = AlertManager.PATTERN_WARN
 
-        # 5. Heat stress
+        # Heat stress
         if self.last_heat_index is not None:
             if self.last_heat_index >= HEAT_INDEX_EXTREME and priority < AlertManager.PATTERN_DANGER:
                 self.alert_level = "HEAT EXTREME"
@@ -618,65 +725,67 @@ class SmartHelmet:
                 self.alert_level = "HEAT CAUTION"
                 priority = AlertManager.PATTERN_WARN
 
-        # 6. Low light
+        # Low light
         if self.last_lux is not None:
             if self.last_lux < LOW_LIGHT_LUX and priority < AlertManager.PATTERN_WARN:
                 self.alert_level = "LOW LIGHT"
                 priority = AlertManager.PATTERN_WARN
 
-        self.alerts.set_pattern(priority)
+        if self.alerts is not None:
+            self.alerts.set_pattern(priority)
 
     # ---- display ----
 
     def _update_display(self):
         """Compose and push status lines to the OLED."""
-        if self.alert_level in ("!! FALL !!", "HELMET OFF"):
-            self.oled.show_alert(
-                "** ALERT **",
-                self.alert_level
-            )
+        if self.oled is None:
             return
 
-        lines = []
-        lines.append(f"STATUS: {self.alert_level}")
+        try:
+            us_str = f"{self.last_us_dist:.1f} cm" if self.last_us_dist is not None else "--"
 
-        # Accelerometer
-        g = self.imu.total_g()
-        lines.append(f"Accel: {g:.2f} g")
+            if self.helmet_det is not None:
+                helmet_worn = not self.helmet_det.helmet_removed
+                helmet_str = "WORN" if helmet_worn else "NOT WORN"
+            else:
+                helmet_str = "UNKNOWN"
 
-        # Distances
-        us_str = f"{self.last_us_dist:.0f}cm" if self.last_us_dist else "--"
-        tof_str = f"{self.last_tof_dist}mm" if self.last_tof_dist else "--"
-        lines.append(f"US:{us_str}  ToF:{tof_str}")
+            lines = [
+                "ULTRASONIC",
+                us_str,
+                "HELMET",
+                helmet_str,
+            ]
 
-        # Temperature / Humidity / Heat Index
-        if self.last_temp is not None:
-            lines.append(f"T:{self.last_temp}C H:{self.last_hum}%")
-            lines.append(f"Heat Idx: {self.last_heat_index}C")
-        else:
-            lines.append("T:--  H:--%")
-            lines.append("Heat Idx: --")
-
-        # Light
-        lux_str = f"{self.last_lux}" if self.last_lux else "--"
-        lines.append(f"Light: {lux_str} lx")
-
-        # Helmet status (touch + IR)
-        helmet_str = "ON" if not self.helmet_det.helmet_removed else "OFF!"
-        touch_str = "Y" if self.helmet_det.touch.is_active else "N"
-        ir_str = "Y" if not self.helmet_det.ir.is_active else "N"
-        lines.append(f"Helmet:{helmet_str} T:{touch_str} IR:{ir_str}")
-
-        self.oled.update(lines)
+            self.oled.update(lines)
+            self._reset_sensor_error("oled")
+        except Exception as e:
+            try:
+                self._record_sensor_error("oled", e)
+            except SensorUnavailableError as disable_exc:
+                self._disable_sensor("oled", disable_exc)
 
     # ---- console log (for debugging over SSH) ----
 
     def _print_status(self):
         import sys
-        ax, ay, az = self.imu.read_accel()
-        gx, gy, gz = self.imu.read_gyro()
-        touch = "Y" if self.helmet_det.touch.is_active else "N"
-        ir = "Y" if not self.helmet_det.ir.is_active else "N"
+        try:
+            if self.imu is not None:
+                ax, ay, az = self.imu.read_accel()
+                gx, gy, gz = self.imu.read_gyro()
+                self._reset_sensor_error("imu")
+            else:
+                ax = ay = az = gx = gy = gz = 0
+        except Exception as e:
+            self._record_sensor_error("imu", e)
+            ax = ay = az = gx = gy = gz = 0
+        if self.helmet_det is not None:
+            touch = "Y" if not self.helmet_det.touch.is_active else "N"
+            ir = "Y" if not self.helmet_det.ir.is_active else "N"
+            helmet_state = 'ON' if not self.helmet_det.helmet_removed else 'OFF'
+        else:
+            touch = ir = '-'
+            helmet_state = '--'
         status_line = (
             f"[{self.alert_level:^14s}] "
             f"A({ax:+.2f},{ay:+.2f},{az:+.2f})g  "
@@ -685,7 +794,7 @@ class SmartHelmet:
             f"T={self.last_temp}C  H={self.last_hum}%  HI={self.last_heat_index}C  "
             f"Lux={self.last_lux}  "
             f"Touch={touch}  IR={ir}  "
-            f"Helmet={'ON' if not self.helmet_det.helmet_removed else 'OFF'}"
+            f"Helmet={helmet_state}"
         )
         print(status_line, flush=True)
         sys.stdout.flush()
@@ -694,18 +803,34 @@ class SmartHelmet:
         """Write latest sensor snapshot to shared JSON file for helmet_api.py."""
         import json
         state_file = "/tmp/helmet_api_state.json"
-        total_g    = self.imu.total_g()
-        total_gyro = self.imu.total_gyro()
-        ax, ay, az = self.imu.read_accel()
-        gx, gy, gz = self.imu.read_gyro()
-        touch_active = self.helmet_det.touch.is_active
-        ir_detecting = not self.helmet_det.ir.is_active
+        try:
+            if self.imu is not None:
+                total_g    = self.imu.total_g()
+                total_gyro = self.imu.total_gyro()
+                ax, ay, az = self.imu.read_accel()
+                gx, gy, gz = self.imu.read_gyro()
+                self._reset_sensor_error("imu")
+            else:
+                total_g = total_gyro = 0
+                ax = ay = az = gx = gy = gz = 0
+        except Exception as e:
+            self._record_sensor_error("imu", e)
+            total_g = total_gyro = 0
+            ax = ay = az = gx = gy = gz = 0
+        if self.helmet_det is not None:
+            touch_active = not self.helmet_det.touch.is_active
+            ir_detecting = not self.helmet_det.ir.is_active
+            helmet_on = not self.helmet_det.helmet_removed
+        else:
+            touch_active = False
+            ir_detecting = False
+            helmet_on = False
         data = {
             "accel":         {"x": round(ax, 3), "y": round(ay, 3), "z": round(az, 3)},
             "gyro":          {"x": round(gx, 2), "y": round(gy, 2), "z": round(gz, 2)},
             "totalG":        round(total_g, 3),
             "totalGyro":     round(total_gyro, 2),
-            "fallDetected":  self.fall_det.fall_detected,
+            "fallDetected":  self.fall_det.fall_detected if self.fall_det is not None else False,
             "temperature":   self.last_temp,
             "humidity":      self.last_hum,
             "heatIndex":     self.last_heat_index,
@@ -714,7 +839,7 @@ class SmartHelmet:
             "lux":           round(self.last_lux, 1) if self.last_lux else None,
             "touchActive":   touch_active,
             "irDetecting":   ir_detecting,
-            "helmetOn":      not self.helmet_det.helmet_removed,
+            "helmetOn":      helmet_on,
             "alertLevel":    self.alert_level,
             "timestamp":     self._now_iso(),
         }
@@ -776,12 +901,17 @@ class SmartHelmet:
     def shutdown(self):
         print("\n[SHUTDOWN] Cleaning up...")
         self.running = False
-        self.alerts.stop()
-        self.oled.clear()
-        self.ultrasonic.close()
-        self.helmet_det.close()
+        if self.alerts is not None:
+            self.alerts.stop()
+        if self.oled is not None:
+            self.oled.clear()
+        if self.ultrasonic is not None:
+            self.ultrasonic.close()
+        if self.helmet_det is not None:
+            self.helmet_det.close()
         try:
-            self.dht.exit()
+            if self.dht is not None:
+                self.dht.exit()
         except Exception:
             pass
         print("[SHUTDOWN] Done. Stay safe!")
