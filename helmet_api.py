@@ -7,6 +7,7 @@ No GPIO needed — all sensors are handled by smart_helmet.py directly.
 Provides:
   GET /api/health   → {"status": "ok"|"starting"|"error"}
   GET /api/sensors  → latest sensor snapshot (from shared file)
+  GET /api/alert-history → 7-day saved alert counts
   POST /api/reset-fall → reset fall detection flag
 
 The React app polls GET /api/sensors every 500 ms.
@@ -27,6 +28,7 @@ from flask_cors import CORS
 # ═══════════════════════════════════════════════════════════════
 
 STATE_FILE = "/tmp/helmet_api_state.json"
+ALERT_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "alert_history.json")
 PORT      = int(os.getenv("HELMET_API_PORT", "5000"))
 HOST      = "0.0.0.0"
 STARTED  = time.time()
@@ -61,12 +63,23 @@ def _is_fresh(state):
         return False
 
 
+def _read_alert_history():
+    try:
+        with open(ALERT_HISTORY_FILE, "r") as f:
+            rows = json.load(f)
+        if isinstance(rows, list):
+            return rows
+    except Exception:
+        pass
+    return []
+
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
         "service": "helmet-api",
         "status": "ok",
-        "endpoints": ["/api/health", "/api/sensors", "/api/reset-fall"]
+        "endpoints": ["/api/health", "/api/sensors", "/api/alert-history", "/api/reset-fall"]
     }), 200
 
 
@@ -75,7 +88,7 @@ def api_root():
     return jsonify({
         "service": "helmet-api",
         "status": "ok",
-        "endpoints": ["/api/health", "/api/sensors", "/api/reset-fall"]
+        "endpoints": ["/api/health", "/api/sensors", "/api/alert-history", "/api/reset-fall"]
     }), 200
 
 
@@ -110,6 +123,11 @@ def sensors():
             "since": datetime.fromtimestamp(STARTED, timezone.utc).isoformat()
         }), 503
     return jsonify(state), 200
+
+
+@app.route("/api/alert-history", methods=["GET"])
+def alert_history():
+    return jsonify({"history": _read_alert_history()}), 200
 
 
 @app.route("/api/reset-fall", methods=["POST"])

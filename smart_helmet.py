@@ -24,6 +24,8 @@ import struct
 import signal
 import sys
 import os
+import json
+from datetime import datetime, timedelta, timezone
 
 # ─── GPIO (works on Raspberry Pi 5 via lgpio / gpiozero) ───
 from gpiozero import DigitalOutputDevice, DigitalInputDevice, TonalBuzzer
@@ -70,6 +72,7 @@ ULTRASONIC_WARN_CM      = 100     # warn if obstacle < 100 cm
 ULTRASONIC_DANGER_CM    = 40      # danger if obstacle < 40 cm
 TOF_WARN_MM             = 600     # VL53L0X warn threshold
 TOF_DANGER_MM           = 250     # VL53L0X danger threshold
+IR_REAR_DETECT_ACTIVE_LOW = True  # rear IR sensor is active-low when an object is detected
 
 # --- Heat Stress (DHT22) ---
 HEAT_INDEX_CAUTION      = 27.0    # °C — caution
@@ -84,6 +87,9 @@ MAIN_LOOP_INTERVAL      = 0.3     # seconds between sensor reads
 OLED_REFRESH_INTERVAL   = 0.5     # seconds between display updates
 BUZZER_SHORT_BEEP       = 0.1
 BUZZER_LONG_BEEP        = 0.5
+
+ALERT_HISTORY_FILE      = os.path.join(os.path.dirname(__file__), "alert_history.json")
+ALERT_HISTORY_DAYS      = 7
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -437,6 +443,9 @@ class HelmetRemovalDetector:
       This wiring is treated as active-low:
         LOW = head contact, HIGH = no contact.
 
+    Rear IR sensor (GPIO20) is mounted on the back of the helmet and is used
+    only for rear-proximity detection / telemetry, not helmet-on detection.
+
     If touch contact is absent continuously for
     HELMET_REMOVAL_SECONDS, the helmet is considered removed.
     """
@@ -444,7 +453,7 @@ class HelmetRemovalDetector:
     def __init__(self, touch_pin, ir_pin):
         # Touch sensor wired active-low: LOW when touching head
         self.touch = DigitalInputDevice(touch_pin, pull_up=True)
-        # IR sensor remains available for telemetry only
+        # Rear IR sensor for rear obstacle / presence detection
         self.ir = DigitalInputDevice(ir_pin, pull_up=True)
 
         self._no_head_since = None
@@ -454,6 +463,12 @@ class HelmetRemovalDetector:
         """Returns True if the touch sensor detects head contact."""
         touch_active = not self.touch.is_active   # LOW = head touching
         return touch_active
+
+    def rear_object_detected(self):
+        """Returns True when the rear IR sensor sees an object behind the helmet."""
+        if IR_REAR_DETECT_ACTIVE_LOW:
+            return not self.ir.is_active
+        return self.ir.is_active
 
     def update(self):
         now = time.monotonic()
@@ -523,7 +538,7 @@ class SmartHelmet:
             print(f"  !! DHT22 unavailable: {e}")
             self.dht = None
 
-        print("  -> Touch Sensor + IR Sensor (helmet detection)")
+        print("  -> Touch Sensor + rear IR sensor")
         try:
             self.helmet_det = HelmetRemovalDetector(PIN_TOUCH, PIN_IR)
         except Exception as e:
@@ -550,6 +565,7 @@ class SmartHelmet:
         self.last_us_dist = None
         self.last_tof_dist = None
         self.alert_level = "OK"  # OK | WARN | DANGER | FALL | HELMET_OFF
+        self._last_logged_alert_level = None
         self._error_counts = {
             "imu": 0,
             "tof": 0,
@@ -662,6 +678,76 @@ class SmartHelmet:
             except SensorUnavailableError as disable_exc:
                 self._disable_sensor("light", disable_exc)
 
+    # ---- alert history ----
+
+    def _load_alert_history(self):
+        try:
+            with open(ALERT_HISTORY_FILE, "r") as f:
+                rows = json.load(f)
+            if isinstance(rows, list):
+                return rows
+        except Exception:
+            pass
+        return []
+
+    def _save_alert_history(self, rows):
+        try:
+            with open(ALERT_HISTORY_FILE, "w") as f:
+                json.dump(rows, f)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            print(f"[WARN] could not save alert history: {e}", flush=True)
+
+    def _record_alert_history(self):
+        level = self.alert_level
+        if level in ("OK", "HELMET OFF"):
+            self._last_logged_alert_level = level
+            return
+        if level == self._last_logged_alert_level:
+            return
+
+        category = None
+        if level == "!! FALL !!":
+            category = "fall"
+        elif level.startswith("HEAT"):
+            category = "heat"
+        elif level in ("PROX WARN", "PROX DANGER", "TOF WARN", "TOF DANGER", "REAR WARN"):
+            category = "prox"
+
+        self._last_logged_alert_level = level
+        if category is None:
+            return
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        rows = self._load_alert_history()
+        by_day = {row.get("date"): row for row in rows if isinstance(row, dict) and row.get("date")}
+
+        if today not in by_day:
+            by_day[today] = {
+                "date": today,
+                "day": datetime.now().strftime("%a"),
+                "fall": 0,
+                "heat": 0,
+                "prox": 0,
+            }
+
+        by_day[today][category] = int(by_day[today].get(category, 0)) + 1
+        by_day[today]["day"] = datetime.now().strftime("%a")
+
+        cutoff = datetime.now(timezone.utc).date() - timedelta(days=ALERT_HISTORY_DAYS - 1)
+        kept = []
+        for date_str, row in by_day.items():
+            try:
+                row_date = datetime.fromisoformat(date_str).date()
+            except Exception:
+                continue
+            if row_date >= cutoff:
+                kept.append(row)
+
+        kept.sort(key=lambda row: row.get("date", ""))
+        self._save_alert_history(kept)
+
     # ---- decision logic ----
 
     def _evaluate_alerts(self):
@@ -713,6 +799,12 @@ class SmartHelmet:
                 self.alert_level = "TOF WARN"
                 priority = AlertManager.PATTERN_WARN
 
+        # Rear proximity (IR sensor on back of helmet)
+        if self.helmet_det is not None and self.helmet_det.rear_object_detected():
+            if priority < AlertManager.PATTERN_WARN:
+                self.alert_level = "REAR WARN"
+                priority = AlertManager.PATTERN_WARN
+
         # Heat stress
         if self.last_heat_index is not None:
             if self.last_heat_index >= HEAT_INDEX_EXTREME and priority < AlertManager.PATTERN_DANGER:
@@ -733,6 +825,8 @@ class SmartHelmet:
 
         if self.alerts is not None:
             self.alerts.set_pattern(priority)
+
+        self._record_alert_history()
 
     # ---- display ----
 
@@ -781,7 +875,7 @@ class SmartHelmet:
             ax = ay = az = gx = gy = gz = 0
         if self.helmet_det is not None:
             touch = "Y" if not self.helmet_det.touch.is_active else "N"
-            ir = "Y" if not self.helmet_det.ir.is_active else "N"
+            ir = "Y" if self.helmet_det.rear_object_detected() else "N"
             helmet_state = 'ON' if not self.helmet_det.helmet_removed else 'OFF'
         else:
             touch = ir = '-'
@@ -801,7 +895,6 @@ class SmartHelmet:
 
     def _write_api_state(self):
         """Write latest sensor snapshot to shared JSON file for helmet_api.py."""
-        import json
         state_file = "/tmp/helmet_api_state.json"
         try:
             if self.imu is not None:
@@ -819,7 +912,7 @@ class SmartHelmet:
             ax = ay = az = gx = gy = gz = 0
         if self.helmet_det is not None:
             touch_active = not self.helmet_det.touch.is_active
-            ir_detecting = not self.helmet_det.ir.is_active
+            ir_detecting = self.helmet_det.rear_object_detected()
             helmet_on = not self.helmet_det.helmet_removed
         else:
             touch_active = False
